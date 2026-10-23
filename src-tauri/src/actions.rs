@@ -537,6 +537,8 @@ impl ShortcutAction for TranscribeAction {
 
         let ah = app.clone();
         let post_process = self.post_process;
+        let benchmark_settings = crate::settings::get_settings(app);
+        let compare = benchmark_settings.remote_stt_compare;
         CAPTURE_QUEUE.submit(move || {
             let capture = match capture.recv() {
                 Ok(capture) => capture,
@@ -558,6 +560,11 @@ impl ShortcutAction for TranscribeAction {
             // Save original samples before resampling, VAD, or waiting for inference.
             let saved = save_original_audio(&wav_path, &capture.samples, capture.sample_rate);
             let audio_saved = saved.is_ok();
+            let audio_seconds = capture.samples.len() as f64 / capture.sample_rate as f64;
+            let benchmark_recording = file_name.clone();
+            if compare && audio_saved {
+                crate::stt_benchmark::enqueue_remote(ah.clone(), wav_path.clone(), benchmark_settings.remote_stt_url.clone(), at, audio_seconds);
+            }
             let history_entry = match saved {
                 Ok(()) => hm.save_pending_entry(file_name, post_process).map_err(|error| {
                     error!("Failed to register recoverable recording: {error}"); error
@@ -570,6 +577,7 @@ impl ShortcutAction for TranscribeAction {
             };
             let fallback = if audio_saved { None } else { Some(capture) };
             PROCESSING_QUEUE.submit(move || {
+                let benchmark_started = Instant::now();
                 let _guard = guard;
                 tauri::async_runtime::block_on(async move {
                     let samples = if let Some(capture) = fallback {
@@ -589,8 +597,18 @@ impl ShortcutAction for TranscribeAction {
                         }
                     };
                     let tm = Arc::clone(&ah.state::<Arc<TranscriptionManager>>());
-                    tm.initiate_model_load();
-                    match tm.transcribe(samples) {
+                    let cold_model = !tm.is_model_loaded();
+                    let transcription_result = if compare {
+                        tm.initiate_local_model_load();
+                        tm.transcribe_local(samples)
+                    } else {
+                        tm.initiate_model_load();
+                        tm.transcribe(samples)
+                    };
+                    if compare {
+                        crate::stt_benchmark::record(&ah, &benchmark_recording, ("local", &benchmark_settings.selected_model), (at, benchmark_started, Instant::now()), audio_seconds, cold_model, &transcription_result);
+                    }
+                    match transcription_result {
                         Ok(transcription) => {
                             let processed = process_transcription_output(&ah, &transcription, post_process).await;
                             if let Some(entry) = &history_entry {

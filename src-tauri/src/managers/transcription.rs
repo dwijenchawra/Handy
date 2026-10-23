@@ -417,6 +417,10 @@ impl TranscriptionManager {
         if get_settings(&self.app_handle).remote_stt_enabled {
             return;
         }
+        self.initiate_local_model_load();
+    }
+
+    pub fn initiate_local_model_load(&self) {
         let mut is_loading = self.is_loading.lock().unwrap();
         if *is_loading || self.is_model_loaded() {
             return;
@@ -446,6 +450,10 @@ impl TranscriptionManager {
         if settings.remote_stt_enabled {
             return crate::remote_stt::transcribe(&settings.remote_stt_url, &audio);
         }
+        self.transcribe_local(audio)
+    }
+
+    pub fn transcribe_local(&self, audio: Vec<f32>) -> Result<String> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(

@@ -7,19 +7,31 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_remote_stt(app: tauri::AppHandle, enabled: bool, url: String) -> Result<(), String> {
+pub fn set_remote_stt(
+    app: tauri::AppHandle,
+    enabled: bool,
+    compare: bool,
+    url: String,
+) -> Result<(), String> {
     let url = url.trim().to_string();
-    if enabled && !url.starts_with("wss://") {
+    if (enabled || compare) && !url.starts_with("wss://") {
         return Err("Remote STT requires a wss:// URL".into());
     }
     let mut settings = crate::settings::get_settings(&app);
-    settings.remote_stt_enabled = enabled;
+    settings.remote_stt_enabled = enabled && !compare;
+    settings.remote_stt_compare = compare;
     settings.remote_stt_url = url;
     crate::settings::write_settings(&app, settings);
     Ok(())
 }
 
+static REMOTE_SESSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn transcribe(url: &str, audio: &[f32]) -> Result<String> {
+    // Switching modes while a benchmark is pending must not open two sessions.
+    let _session = REMOTE_SESSION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Remote session lock poisoned"))?;
     // The caller may already be inside Tauri's runtime. Use an isolated runtime
     // rather than nesting block_on or blocking a runtime executor with socket IO.
     std::thread::scope(|scope| {
@@ -63,9 +75,9 @@ async fn transcribe_async(url: &str, audio: &[f32]) -> Result<String> {
     let (mut sink, mut stream) = socket.split();
     let send = async {
         // 100 ms of mono float32 PCM: 6,400 bytes, safely below the 64 KB limit.
-        let start = tokio::time::Instant::now();
-        for (index, chunk) in audio.chunks(1600).enumerate() {
-            tokio::time::sleep_until(start + Duration::from_millis(index as u64 * 100)).await;
+        // Completed audio can be uploaded immediately. Socket backpressure
+        // bounds transmission without adding the recording duration as latency.
+        for chunk in audio.chunks(1600) {
             let bytes: Vec<u8> = chunk
                 .iter()
                 .flat_map(|sample| sample.to_le_bytes())

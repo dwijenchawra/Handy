@@ -20,6 +20,7 @@ mod serial_queue;
 mod settings;
 mod shortcut;
 mod signal_handle;
+mod stt_benchmark;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
@@ -371,6 +372,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_app_language_setting,
             shortcut::change_use_accessibility_context_setting,
             remote_stt::set_remote_stt,
+            stt_benchmark::get_stt_benchmarks,
             shortcut::change_update_checks_setting,
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,

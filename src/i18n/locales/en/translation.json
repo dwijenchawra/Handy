@@ -545,11 +545,28 @@
     },
     "remoteStt": {
       "label": "Remote speech recognition (experimental)",
-      "description": "Send completed recordings to your WebSocket STT server. Audio stays saved locally for retry. Upload runs at real-time speed; local model options do not apply. Changes apply when the next queued recording starts processing.",
+      "description": "Send completed recordings to your WebSocket STT server. Audio stays saved locally for retry. Local model options do not apply. Changes apply when the next queued recording starts processing.",
       "enable": "Save and use remote server",
       "disable": "Use local model",
       "remoteActive": "Remote recognition enabled",
-      "localActive": "Local recognition enabled"
+      "localActive": "Local recognition enabled",
+      "compare": "Compare both (paste local)",
+      "compareActive": "Comparison enabled: independent local and remote queues; only local text is pasted",
+      "timingDescription": "E2E seconds run from Fn release to final STT text, including capture finalization, saving, queue wait, resampling and model loading/network work. Before worker includes saving and queue wait. Excludes LLM post-processing and paste. Simultaneous testing can add contention. Results appear when each backend finishes; refresh to update.",
+      "refreshResults": "Refresh timing results",
+      "columns": {
+        "recording": "Recording",
+        "backend": "Backend",
+        "e2e": "E2E (s)",
+        "queue": "Before worker (s)",
+        "processing": "Worker (s)",
+        "status": "Status"
+      },
+      "local": "Local",
+      "remote": "Remote",
+      "cold": "OK (model loaded for take)",
+      "success": "OK",
+      "failed": "Failed (hover for error)"
     }
   },
   "footer": {
