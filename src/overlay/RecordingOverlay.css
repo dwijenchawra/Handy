@@ -93,3 +93,8 @@
 .cancel-button:active {
   transform: scale(0.95);
 }
+
+/* The last processing state remains mounted when hidden. Pause its animation. */
+.recording-overlay:not(.fade-in) .transcribing-text {
+  animation-play-state: paused;
+}

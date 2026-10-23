@@ -422,13 +422,14 @@ impl TranscriptionManager {
         *is_loading = true;
         let self_clone = self.clone();
         thread::spawn(move || {
+            let _loading_guard = LoadingGuard {
+                is_loading: self_clone.is_loading.clone(),
+                loading_condvar: self_clone.loading_condvar.clone(),
+            };
             let settings = get_settings(&self_clone.app_handle);
             if let Err(e) = self_clone.load_model(&settings.selected_model) {
                 error!("Failed to load model: {}", e);
             }
-            let mut is_loading = self_clone.is_loading.lock().unwrap();
-            *is_loading = false;
-            self_clone.loading_condvar.notify_all();
         });
     }
 

@@ -1,3 +1,5 @@
+mod capture;
+pub use capture::CapturedAudio;
 // Re-export all audio components
 mod device;
 mod recorder;

@@ -19,27 +19,41 @@ const RecordingOverlay: React.FC = () => {
   const [state, setState] = useState<OverlayState>("recording");
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
+  const showLevelsRef = useRef(false);
   const direction = getLanguageDirection(i18n.language);
 
   useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const retainListener = (unlisten: () => void) => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    };
     const setupEventListeners = async () => {
       // Listen for show-overlay event from Rust
-      const unlistenShow = await listen("show-overlay", async (event) => {
-        // Sync language from settings each time overlay is shown
-        await syncLanguageFromSettings();
-        const overlayState = event.payload as OverlayState;
-        setState(overlayState);
-        setIsVisible(true);
-      });
+      const unlistenShow = await listen<OverlayState>(
+        "show-overlay",
+        (event) => {
+          // Language synchronization must not reorder recording/processing events.
+          void syncLanguageFromSettings().catch(console.error);
+          showLevelsRef.current = event.payload === "recording";
+          setState(event.payload);
+          setIsVisible(true);
+        },
+      );
+      retainListener(unlistenShow);
 
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
+        showLevelsRef.current = false;
         setIsVisible(false);
       });
+      retainListener(unlistenHide);
 
       // Listen for mic-level updates
       const unlistenLevel = await listen<number[]>("mic-level", (event) => {
-        const newLevels = event.payload as number[];
+        if (!showLevelsRef.current) return;
+        const newLevels = event.payload;
 
         // Apply smoothing to reduce jitter
         const smoothed = smoothedLevelsRef.current.map((prev, i) => {
@@ -51,15 +65,15 @@ const RecordingOverlay: React.FC = () => {
         setLevels(smoothed.slice(0, 9));
       });
 
-      // Cleanup function
-      return () => {
-        unlistenShow();
-        unlistenHide();
-        unlistenLevel();
-      };
+      retainListener(unlistenLevel);
     };
 
-    setupEventListeners();
+    void setupEventListeners().catch(console.error);
+    return () => {
+      disposed = true;
+      showLevelsRef.current = false;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
   }, []);
 
   const getIcon = () => {

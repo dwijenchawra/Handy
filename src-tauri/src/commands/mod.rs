@@ -176,6 +176,12 @@ pub fn initialize_shortcuts(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    // Arm the microphone before accepting shortcuts. Cold device startup cannot
+    // capture speech that has already happened.
+    app.state::<std::sync::Arc<crate::managers::audio::AudioRecordingManager>>()
+        .start_microphone_stream()
+        .map_err(|e| e.to_string())?;
+
     // Initialize shortcuts
     crate::shortcut::init_shortcuts(&app);
 

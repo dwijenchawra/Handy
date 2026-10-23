@@ -2,7 +2,10 @@ use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -16,10 +19,9 @@ enum Command {
         hotkey_string: String,
         is_pressed: bool,
         push_to_talk: bool,
+        at: Instant,
     },
-    Cancel {
-        recording_was_active: bool,
-    },
+    Cancel,
     ProcessingFinished,
 }
 
@@ -27,7 +29,6 @@ enum Command {
 enum Stage {
     Idle,
     Recording(String), // binding_id
-    Processing,
 }
 
 /// Serialises all transcription lifecycle events through a single thread
@@ -35,6 +36,7 @@ enum Stage {
 /// the async transcribe-paste pipeline.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
+    pending: Arc<AtomicUsize>,
 }
 
 pub fn is_transcribe_binding(id: &str) -> bool {
@@ -45,6 +47,8 @@ impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
 
+        let pending = Arc::new(AtomicUsize::new(0));
+        let pending_worker = pending.clone();
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut stage = Stage::Idle;
@@ -57,10 +61,11 @@ impl TranscriptionCoordinator {
                             hotkey_string,
                             is_pressed,
                             push_to_talk,
+                            at,
                         } => {
                             // Debounce rapid-fire press events (key repeat / double-tap).
                             // Releases always pass through for push-to-talk.
-                            if is_pressed {
+                            if is_pressed && !push_to_talk {
                                 let now = Instant::now();
                                 if last_press.map_or(false, |t| now.duration_since(t) < DEBOUNCE) {
                                     debug!("Debounced press for '{binding_id}'");
@@ -71,19 +76,19 @@ impl TranscriptionCoordinator {
 
                             if push_to_talk {
                                 if is_pressed && matches!(stage, Stage::Idle) {
-                                    start(&app, &mut stage, &binding_id, &hotkey_string);
+                                    start(&app, &mut stage, &binding_id, &hotkey_string, at);
                                 } else if !is_pressed
                                     && matches!(&stage, Stage::Recording(id) if id == &binding_id)
                                 {
-                                    stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                    stop(&app, &mut stage, &binding_id, &hotkey_string, at);
                                 }
                             } else if is_pressed {
                                 match &stage {
                                     Stage::Idle => {
-                                        start(&app, &mut stage, &binding_id, &hotkey_string);
+                                        start(&app, &mut stage, &binding_id, &hotkey_string, at);
                                     }
                                     Stage::Recording(id) if id == &binding_id => {
-                                        stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                        stop(&app, &mut stage, &binding_id, &hotkey_string, at);
                                     }
                                     _ => {
                                         debug!("Ignoring press for '{binding_id}': pipeline busy")
@@ -91,18 +96,27 @@ impl TranscriptionCoordinator {
                                 }
                             }
                         }
-                        Command::Cancel {
-                            recording_was_active,
-                        } => {
-                            // Don't reset during processing — wait for the pipeline to finish.
-                            if !matches!(stage, Stage::Processing)
-                                && (recording_was_active || matches!(stage, Stage::Recording(_)))
-                            {
-                                stage = Stage::Idle;
+                        Command::Cancel => {
+                            crate::utils::cancel_recording_now(&app);
+                            stage = Stage::Idle;
+                            if pending_worker.load(Ordering::SeqCst) > 0 {
+                                crate::utils::show_transcribing_overlay(&app);
                             }
                         }
                         Command::ProcessingFinished => {
-                            stage = Stage::Idle;
+                            pending_worker.fetch_sub(1, Ordering::SeqCst);
+                            // A finished job must never reset a newer recording.
+                            if !app.state::<Arc<AudioRecordingManager>>().is_recording() {
+                                if pending_worker.load(Ordering::SeqCst) == 0 {
+                                    crate::utils::hide_recording_overlay(&app);
+                                    crate::tray::change_tray_icon(
+                                        &app,
+                                        crate::tray::TrayIconState::Idle,
+                                    );
+                                } else {
+                                    crate::utils::show_transcribing_overlay(&app);
+                                }
+                            }
                         }
                     }
                 }
@@ -113,7 +127,7 @@ impl TranscriptionCoordinator {
             }
         });
 
-        Self { tx }
+        Self { tx, pending }
     }
 
     /// Send a keyboard/signal input event for a transcribe binding.
@@ -132,6 +146,7 @@ impl TranscriptionCoordinator {
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
                 push_to_talk,
+                at: Instant::now(),
             })
             .is_err()
         {
@@ -139,16 +154,14 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
-        if self
-            .tx
-            .send(Command::Cancel {
-                recording_was_active,
-            })
-            .is_err()
-        {
+    pub fn notify_cancel(&self) {
+        if self.tx.send(Command::Cancel).is_err() {
             warn!("Transcription coordinator channel closed");
         }
+    }
+
+    pub fn begin_processing(&self) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn notify_processing_finished(&self) {
@@ -158,12 +171,12 @@ impl TranscriptionCoordinator {
     }
 }
 
-fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
+fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str, at: Instant) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.start(app, binding_id, hotkey_string);
+    action.start_at(app, binding_id, hotkey_string, at);
     if app
         .try_state::<Arc<AudioRecordingManager>>()
         .map_or(false, |a| a.is_recording())
@@ -174,11 +187,11 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
     }
 }
 
-fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
+fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str, at: Instant) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.stop(app, binding_id, hotkey_string);
-    *stage = Stage::Processing;
+    action.stop_at(app, binding_id, hotkey_string, at);
+    *stage = Stage::Idle;
 }

@@ -214,15 +214,39 @@ impl HistoryManager {
         &self.recordings_dir
     }
 
-    /// Save a new history entry to the database.
-    /// The WAV file should already have been written to the recordings directory.
-    pub fn save_entry(
+    /// Pin queued audio so retention cannot remove it before inference completes.
+    pub fn save_pending_entry(
+        &self,
+        file_name: String,
+        post_process_requested: bool,
+    ) -> Result<HistoryEntry> {
+        self.insert_entry(
+            file_name,
+            String::new(),
+            post_process_requested,
+            None,
+            None,
+            true,
+        )
+    }
+
+    pub fn release_pending_entry(&self, id: i64) -> Result<()> {
+        self.get_connection()?.execute(
+            "UPDATE transcription_history SET saved = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        let _ = (HistoryUpdatePayload::Toggled { id }).emit(&self.app_handle);
+        Ok(())
+    }
+
+    fn insert_entry(
         &self,
         file_name: String,
         transcription_text: String,
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        saved: bool,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -242,7 +266,7 @@ impl HistoryManager {
             params![
                 &file_name,
                 timestamp,
-                false,
+                saved,
                 &title,
                 &transcription_text,
                 &post_processed_text,
@@ -255,7 +279,7 @@ impl HistoryManager {
             id: conn.last_insert_rowid(),
             file_name,
             timestamp,
-            saved: false,
+            saved,
             title,
             transcription_text,
             post_processed_text,

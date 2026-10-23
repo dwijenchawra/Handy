@@ -67,43 +67,54 @@ pub async fn retry_history_entry_transcription(
     transcription_manager: State<'_, Arc<TranscriptionManager>>,
     id: i64,
 ) -> Result<(), String> {
-    let entry = history_manager
-        .get_entry_by_id(id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("History entry {} not found", id))?;
+    let history_manager = Arc::clone(&history_manager);
+    let transcription_manager = Arc::clone(&transcription_manager);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::actions::PROCESSING_QUEUE.submit(move || {
+        let result = tauri::async_runtime::block_on(async move {
+            let entry = history_manager
+                .get_entry_by_id(id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("History entry {} not found", id))?;
 
-    let audio_path = history_manager.get_audio_file_path(&entry.file_name);
-    let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
-        .map_err(|e| format!("Failed to load audio: {}", e))?;
+            let audio_path = history_manager.get_audio_file_path(&entry.file_name);
+            let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
+                .map_err(|e| format!("Failed to load audio: {}", e))?;
 
-    if samples.is_empty() {
-        return Err("Recording has no audio samples".to_string());
-    }
+            if samples.is_empty() {
+                return Err("Recording has no audio samples".to_string());
+            }
 
-    transcription_manager.initiate_model_load();
+            transcription_manager.initiate_model_load();
 
-    let tm = Arc::clone(&transcription_manager);
-    let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
-        .await
-        .map_err(|e| format!("Transcription task panicked: {}", e))?
-        .map_err(|e| e.to_string())?;
+            let tm = Arc::clone(&transcription_manager);
+            let transcription =
+                tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
+                    .await
+                    .map_err(|e| format!("Transcription task panicked: {}", e))?
+                    .map_err(|e| e.to_string())?;
 
-    if transcription.is_empty() {
-        return Err("Recording contains no speech".to_string());
-    }
+            if transcription.is_empty() {
+                return Err("Recording contains no speech".to_string());
+            }
 
-    let processed =
-        process_transcription_output(&app, &transcription, entry.post_process_requested).await;
-    history_manager
-        .update_transcription(
-            id,
-            transcription,
-            processed.post_processed_text,
-            processed.post_process_prompt,
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+            let processed =
+                process_transcription_output(&app, &transcription, entry.post_process_requested)
+                    .await;
+            history_manager
+                .update_transcription(
+                    id,
+                    transcription,
+                    processed.post_processed_text,
+                    processed.post_process_prompt,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let _ = tx.send(result);
+    });
+    rx.await.map_err(|e| format!("Retry queue failed: {e}"))?
 }
 
 #[tauri::command]

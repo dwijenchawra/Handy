@@ -122,6 +122,15 @@ function App() {
     };
   }, [t]);
 
+  useEffect(() => {
+    const unlisten = listen("transcription-error", () => {
+      toast.error(t("settings.history.transcriptionFailed"));
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
   // Listen for paste failures and show a toast.
   // The technical error detail is logged to handy.log on the Rust side
   // (see actions.rs `error!("Failed to paste transcription: ...")`),

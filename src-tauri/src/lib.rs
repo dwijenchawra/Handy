@@ -1,3 +1,4 @@
+mod accessibility;
 mod actions;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod apple_intelligence;
@@ -9,9 +10,12 @@ mod commands;
 mod helpers;
 mod input;
 mod llm_client;
+#[cfg(target_os = "macos")]
+mod macos_mute;
 mod managers;
 mod overlay;
 pub mod portable;
+mod serial_queue;
 mod settings;
 mod shortcut;
 mod signal_handle;
@@ -364,6 +368,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_append_trailing_space_setting,
             shortcut::change_lazy_stream_close_setting,
             shortcut::change_app_language_setting,
+            shortcut::change_use_accessibility_context_setting,
             shortcut::change_update_checks_setting,
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,
@@ -429,13 +434,17 @@ pub fn run(cli_args: CliArgs) {
         ])
         .events(collect_events![managers::history::HistoryUpdatePayload,]);
 
-    #[cfg(debug_assertions)] // <- Only export on non-release builds
-    specta_builder
-        .export(
+    // Packaged debug apps also have debug assertions, but must not try to
+    // generate repository files when Finder launches them from `/`.
+    #[cfg(debug_assertions)]
+    if tauri::is_dev() {
+        if let Err(error) = specta_builder.export(
             Typescript::default().bigint(BigIntExportBehavior::Number),
-            "../src/bindings.ts",
-        )
-        .expect("Failed to export typescript bindings");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts"),
+        ) {
+            log::error!("Failed to export TypeScript bindings: {error}");
+        }
+    }
 
     let invoke_handler = specta_builder.invoke_handler();
 

@@ -396,6 +396,10 @@
           "refreshModels": "Refresh models"
         }
       },
+      "accessibilityContext": {
+        "label": "Use Screen Context",
+        "description": "Capture text from the currently focused window and send it to the LLM as additional context. This helps correct spelling, technical terms, and code based on what you're looking at."
+      },
       "prompts": {
         "title": "Prompt",
         "selectedPrompt": {
@@ -471,6 +475,7 @@
         "placeholder": "Select retention period..."
       },
       "alwaysOnMicrophone": {
+        "captureReadyDescription": "The microphone stays ready while Handy is running so recording can begin on key press. Only active recordings are saved.",
         "label": "Always-On Microphone",
         "description": "Keep microphone active for faster response"
       },

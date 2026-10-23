@@ -1,6 +1,6 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
-use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_feedback::{play_feedback_sound, SoundType};
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
@@ -8,9 +8,7 @@ use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{change_tray_icon, TrayIconState};
-use crate::utils::{
-    self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
-};
+use crate::utils::{self, show_recording_overlay, show_transcribing_overlay};
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use log::{debug, error, warn};
@@ -42,6 +40,12 @@ impl Drop for FinishGuard {
 pub trait ShortcutAction: Send + Sync {
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    fn start_at(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _at: Instant) {
+        self.start(app, binding_id, shortcut_str);
+    }
+    fn stop_at(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _at: Instant) {
+        self.stop(app, binding_id, shortcut_str);
+    }
 }
 
 // Transcribe Action
@@ -58,12 +62,30 @@ fn strip_invisible_chars(s: &str) -> String {
 }
 
 /// Build a system prompt from the user's prompt template.
-/// Removes `${output}` placeholder since the transcription is sent as the user message.
-fn build_system_prompt(prompt_template: &str) -> String {
-    prompt_template.replace("${output}", "").trim().to_string()
+/// Replaces `${output}` with empty string (transcription is sent as user message).
+/// Replaces `${screen_context}` with captured screen context, or removes it if none.
+fn build_system_prompt(prompt_template: &str, screen_context: Option<&str>) -> String {
+    let ctx_placeholder = "${screen_context}";
+    let has_placeholder = prompt_template.contains(ctx_placeholder);
+    let with_ctx = match screen_context {
+        Some(ctx) if !ctx.is_empty() => prompt_template.replace(
+            ctx_placeholder,
+            &format!(
+                "--- Screen Context ---\n{}\n--- End Screen Context ---",
+                ctx
+            ),
+        ),
+        _ if has_placeholder => prompt_template.replace(ctx_placeholder, "(no screen context)"),
+        _ => prompt_template.to_string(),
+    };
+    with_ctx.replace("${output}", "").trim().to_string()
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+    screen_context: Option<&str>,
+) -> Option<String> {
     let provider = match settings.active_post_process_provider().cloned() {
         Some(provider) => provider,
         None => {
@@ -144,7 +166,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
 
-        let system_prompt = build_system_prompt(&prompt);
+        let system_prompt = build_system_prompt(&prompt, screen_context);
         let user_content = transcription.to_string();
 
         // Handle Apple Intelligence separately since it uses native Swift APIs
@@ -258,8 +280,18 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         }
     }
 
-    // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
+    // Legacy mode: Replace ${output} and ${screen_context} variables
+    let mut processed_prompt = prompt.replace("${output}", transcription);
+    processed_prompt = match screen_context {
+        Some(ctx) if !ctx.is_empty() => processed_prompt.replace(
+            "${screen_context}",
+            &format!(
+                "--- Screen Context ---\n{}\n--- End Screen Context ---",
+                ctx
+            ),
+        ),
+        _ => processed_prompt.replace("${screen_context}", "(no screen context)"),
+    };
     debug!("Processed prompt length: {} chars", processed_prompt.len());
 
     match crate::llm_client::send_chat_completion(
@@ -356,12 +388,41 @@ pub(crate) async fn process_transcription_output(
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
 
+    // Capture screen context via accessibility API (macOS only).
+    // This fires on every transcribe when the toggle is on (not just post-process),
+    // so you can verify capture in logs even without an LLM provider configured.
+    let screen_context: Option<String> = if settings.use_accessibility_context {
+        #[cfg(target_os = "macos")]
+        {
+            let ctx = crate::accessibility::get_focused_ui_text();
+            match &ctx {
+                Some(text) => debug!(
+                    "Accessibility context captured ({} chars):\n---\n{}\n---",
+                    text.len(),
+                    text
+                ),
+                None => debug!("Accessibility context: no focused element or permissions denied"),
+            }
+            ctx
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &settings;
+            warn!("Accessibility context is only supported on macOS");
+            None
+        }
+    } else {
+        None
+    };
+
     if let Some(converted_text) = maybe_convert_chinese_variant(&settings, transcription).await {
         final_text = converted_text;
     }
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
+        if let Some(processed_text) =
+            post_process_transcription(&settings, &final_text, screen_context.as_deref()).await
+        {
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
 
@@ -386,74 +447,29 @@ pub(crate) async fn process_transcription_output(
     }
 }
 
+static CAPTURE_QUEUE: Lazy<crate::serial_queue::SerialQueue> =
+    Lazy::new(|| crate::serial_queue::SerialQueue::new("dictation-persistence"));
+pub(crate) static PROCESSING_QUEUE: Lazy<crate::serial_queue::SerialQueue> =
+    Lazy::new(|| crate::serial_queue::SerialQueue::new("dictation-inference"));
+static RECORDING_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+        self.start_at(app, binding_id, shortcut_str, Instant::now());
+    }
+
+    fn start_at(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, at: Instant) {
         let start_time = Instant::now();
-        debug!("TranscribeAction::start called for binding: {}", binding_id);
-
-        // Load model in the background
-        let tm = app.state::<Arc<TranscriptionManager>>();
         let rm = app.state::<Arc<AudioRecordingManager>>();
-
-        // Load ASR model and VAD model in parallel
-        tm.initiate_model_load();
-        let rm_clone = Arc::clone(&rm);
-        std::thread::spawn(move || {
-            if let Err(e) = rm_clone.preload_vad() {
-                debug!("VAD pre-load failed: {}", e);
-            }
-        });
-
-        let binding_id = binding_id.to_string();
-        change_tray_icon(app, TrayIconState::Recording);
-        show_recording_overlay(app);
-
-        // Get the microphone mode to determine audio feedback timing
-        let settings = get_settings(app);
-        let is_always_on = settings.always_on_microphone;
-        debug!("Microphone mode - always_on: {}", is_always_on);
-
-        let mut recording_error: Option<String> = None;
-        if is_always_on {
-            // Always-on mode: Play audio feedback immediately, then apply mute after sound finishes
-            debug!("Always-on mode: Playing audio feedback immediately");
-            let rm_clone = Arc::clone(&rm);
-            let app_clone = app.clone();
-            // The blocking helper exits immediately if audio feedback is disabled,
-            // so we can always reuse this thread to ensure mute happens right after playback.
-            std::thread::spawn(move || {
-                play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                rm_clone.apply_mute();
-            });
-
-            if let Err(e) = rm.try_start_recording(&binding_id) {
-                debug!("Recording failed: {}", e);
-                recording_error = Some(e);
-            }
-        } else {
-            // On-demand mode: Start recording first, then play audio feedback, then apply mute
-            // This allows the microphone to be activated before playing the sound
-            debug!("On-demand mode: Starting recording first, then audio feedback");
-            let recording_start_time = Instant::now();
-            match rm.try_start_recording(&binding_id) {
-                Ok(()) => {
-                    debug!("Recording started in {:?}", recording_start_time.elapsed());
-                    // Small delay to ensure microphone stream is active
-                    let app_clone = app.clone();
-                    let rm_clone = Arc::clone(&rm);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        debug!("Handling delayed audio feedback/mute sequence");
-                        // Helper handles disabled audio feedback by returning early, so we reuse it
-                        // to keep mute sequencing consistent in every mode.
-                        play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                        rm_clone.apply_mute();
-                    });
-                }
-                Err(e) => {
-                    debug!("Failed to start recording: {}", e);
-                    recording_error = Some(e);
-                }
+        // Capture is always the first operation. Model loading belongs to the
+        // processing worker, since the previous job may currently own the engine.
+        let recording_error = rm.try_start_recording_at(binding_id, at).err();
+        if recording_error.is_none() {
+            rm.apply_mute();
+            change_tray_icon(app, TrayIconState::Recording);
+            show_recording_overlay(app);
+            if !get_settings(app).mute_while_recording {
+                play_feedback_sound(app, SoundType::Start);
             }
         }
 
@@ -489,175 +505,148 @@ impl ShortcutAction for TranscribeAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        // Unregister the cancel shortcut when transcription stops
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+        self.stop_at(app, binding_id, shortcut_str, Instant::now());
+    }
+
+    fn stop_at(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, at: Instant) {
+        let rm = app.state::<Arc<AudioRecordingManager>>();
+        // Seal before UI, unmuting, or any disk/model work. The receiver includes
+        // the final hardware buffer even if it arrives after the key release.
+        let capture = match rm.finish_recording_at(binding_id, at) {
+            Ok(capture) => capture,
+            Err(error) => {
+                error!("Failed to finish capture: {error}");
+                let _ = app.emit(
+                    "recording-error",
+                    RecordingErrorEvent {
+                        error_type: "unknown".into(),
+                        detail: Some(error),
+                    },
+                );
+                return;
+            }
+        };
+        app.state::<TranscriptionCoordinator>().begin_processing();
+        let guard = FinishGuard(app.clone());
         shortcut::unregister_cancel_shortcut(app);
-
-        let stop_time = Instant::now();
-        debug!("TranscribeAction::stop called for binding: {}", binding_id);
-
-        let ah = app.clone();
-        let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
-        let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
-        let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
-
+        rm.remove_mute();
+        play_feedback_sound(app, SoundType::Stop);
         change_tray_icon(app, TrayIconState::Transcribing);
         show_transcribing_overlay(app);
 
-        // Unmute before playing audio feedback so the stop sound is audible
-        rm.remove_mute();
-
-        // Play audio feedback for recording stop
-        play_feedback_sound(app, SoundType::Stop);
-
-        let binding_id = binding_id.to_string(); // Clone binding_id for the async task
+        let ah = app.clone();
         let post_process = self.post_process;
-
-        tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone());
-            debug!(
-                "Starting async transcription task for binding: {}",
-                binding_id
-            );
-
-            let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id) {
-                debug!(
-                    "Recording stopped and samples retrieved in {:?}, sample count: {}",
-                    stop_recording_time.elapsed(),
-                    samples.len()
-                );
-
-                if samples.is_empty() {
-                    debug!("Recording produced no audio samples; skipping persistence");
-                    utils::hide_recording_overlay(&ah);
-                    change_tray_icon(&ah, TrayIconState::Idle);
-                } else {
-                    // Save WAV concurrently with transcription
-                    let sample_count = samples.len();
-                    let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
-                    let wav_path = hm.recordings_dir().join(&file_name);
-                    let wav_path_for_verify = wav_path.clone();
-                    let samples_for_wav = samples.clone();
-                    let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
-                    });
-
-                    // Transcribe concurrently with WAV save
-                    let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
-
-                    // Await WAV save and verify
-                    let wav_saved = match wav_handle.await {
-                        Ok(Ok(())) => {
-                            match crate::audio_toolkit::verify_wav_file(
-                                &wav_path_for_verify,
-                                sample_count,
-                            ) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    error!("WAV verification failed: {}", e);
-                                    false
-                                }
+        CAPTURE_QUEUE.submit(move || {
+            let capture = match capture.recv() {
+                Ok(capture) => capture,
+                Err(error) => {
+                    error!("Capture worker disconnected: {error}");
+                    let _ = ah.emit("recording-error", RecordingErrorEvent { error_type: "unknown".into(), detail: Some(error.to_string()) });
+                    return;
+                }
+            };
+            if let Some(error) = &capture.error {
+                error!("Incomplete recording: {error}");
+                let _ = ah.emit("recording-error", RecordingErrorEvent { error_type: "unknown".into(), detail: Some(error.clone()) });
+            }
+            if capture.samples.is_empty() { return; }
+            let hm = Arc::clone(&ah.state::<Arc<HistoryManager>>());
+            let id = RECORDING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let file_name = format!("handy-{}-{id}.wav", chrono::Utc::now().timestamp_micros());
+            let wav_path = hm.recordings_dir().join(&file_name);
+            // Save original samples before resampling, VAD, or waiting for inference.
+            let saved = save_original_audio(&wav_path, &capture.samples, capture.sample_rate);
+            let audio_saved = saved.is_ok();
+            let history_entry = match saved {
+                Ok(()) => hm.save_pending_entry(file_name, post_process).map_err(|error| {
+                    error!("Failed to register recoverable recording: {error}"); error
+                }).ok(),
+                Err(error) => {
+                    error!("Failed to preserve recording: {error}");
+                    let _ = ah.emit("recording-error", RecordingErrorEvent { error_type: "unknown".into(), detail: Some(error.to_string()) });
+                    None
+                }
+            };
+            let fallback = if audio_saved { None } else { Some(capture) };
+            PROCESSING_QUEUE.submit(move || {
+                let _guard = guard;
+                tauri::async_runtime::block_on(async move {
+                    let samples = if let Some(capture) = fallback {
+                        let mut samples = Vec::new();
+                        let mut resampler = crate::audio_toolkit::audio::FrameResampler::new(capture.sample_rate as usize, 16000, std::time::Duration::from_millis(30));
+                        resampler.push(&capture.samples, |frame| samples.extend_from_slice(frame));
+                        resampler.finish(|frame| samples.extend_from_slice(frame));
+                        samples
+                    } else {
+                        match crate::audio_toolkit::read_wav_samples(&wav_path) {
+                            Ok(samples) => samples,
+                            Err(error) => {
+                                error!("Failed to read queued audio: {error}");
+                                let _ = ah.emit("transcription-error", error.to_string());
+                                return;
                             }
-                        }
-                        Ok(Err(e)) => {
-                            error!("Failed to save WAV file: {}", e);
-                            false
-                        }
-                        Err(e) => {
-                            error!("WAV save task panicked: {}", e);
-                            false
                         }
                     };
-
-                    match transcription_result {
+                    let tm = Arc::clone(&ah.state::<Arc<TranscriptionManager>>());
+                    tm.initiate_model_load();
+                    match tm.transcribe(samples) {
                         Ok(transcription) => {
-                            debug!(
-                                "Transcription completed in {:?}: '{}'",
-                                transcription_time.elapsed(),
-                                transcription
-                            );
-
-                            if post_process {
-                                show_processing_overlay(&ah);
-                            }
-                            let processed =
-                                process_transcription_output(&ah, &transcription, post_process)
-                                    .await;
-
-                            // Save to history if WAV was saved
-                            if wav_saved {
-                                if let Err(err) = hm.save_entry(
-                                    file_name,
-                                    transcription,
-                                    post_process,
-                                    processed.post_processed_text.clone(),
-                                    processed.post_process_prompt.clone(),
-                                ) {
-                                    error!("Failed to save history entry: {}", err);
+                            let processed = process_transcription_output(&ah, &transcription, post_process).await;
+                            if let Some(entry) = &history_entry {
+                                if let Err(error) = hm.update_transcription(entry.id, transcription, processed.post_processed_text.clone(), processed.post_process_prompt.clone()) {
+                                    error!("Failed to update transcription history: {error}");
+                                } else if !processed.final_text.is_empty() {
+                                    if let Err(error) = hm.release_pending_entry(entry.id) {
+                                        error!("Failed to release pending recording retention: {error}");
+                                    }
                                 }
                             }
-
-                            if processed.final_text.is_empty() {
-                                utils::hide_recording_overlay(&ah);
-                                change_tray_icon(&ah, TrayIconState::Idle);
-                            } else {
-                                let ah_clone = ah.clone();
-                                let paste_time = Instant::now();
-                                let final_text = processed.final_text;
-                                ah.run_on_main_thread(move || {
-                                    match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to paste transcription: {}", e);
-                                            let _ = ah_clone.emit("paste-error", ());
-                                        }
+                            if !processed.final_text.is_empty() {
+                                // Wait for the paste so results cannot overtake each other.
+                                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                                let paste_app = ah.clone();
+                                if let Err(error) = ah.run_on_main_thread(move || {
+                                    if let Err(error) = utils::paste(processed.final_text, paste_app.clone()) {
+                                        error!("Failed to paste transcription: {error}");
+                                        let _ = paste_app.emit("paste-error", ());
                                     }
-                                    utils::hide_recording_overlay(&ah_clone);
-                                    change_tray_icon(&ah_clone, TrayIconState::Idle);
-                                })
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    change_tray_icon(&ah, TrayIconState::Idle);
-                                });
+                                    let _ = done_tx.send(());
+                                }) {
+                                    error!("Failed to schedule paste: {error}");
+                                    let _ = ah.emit("paste-error", ());
+                                } else { let _ = done_rx.await; }
                             }
                         }
-                        Err(err) => {
-                            debug!("Global Shortcut Transcription error: {}", err);
-                            // Save entry with empty text so user can retry
-                            if wav_saved {
-                                if let Err(save_err) = hm.save_entry(
-                                    file_name,
-                                    String::new(),
-                                    post_process,
-                                    None,
-                                    None,
-                                ) {
-                                    error!("Failed to save failed history entry: {}", save_err);
-                                }
-                            }
-                            utils::hide_recording_overlay(&ah);
-                            change_tray_icon(&ah, TrayIconState::Idle);
+                        Err(error) => {
+                            error!("Transcription failed; original recording retained for retry: {error}");
+                            let _ = ah.emit("transcription-error", error.to_string());
                         }
                     }
-                }
-            } else {
-                debug!("No samples retrieved from recording stop");
-                utils::hide_recording_overlay(&ah);
-                change_tray_icon(&ah, TrayIconState::Idle);
-            }
+                });
+            });
         });
-
-        debug!(
-            "TranscribeAction::stop completed in {:?}",
-            stop_time.elapsed()
-        );
     }
+}
+
+fn save_original_audio(
+    path: &std::path::Path,
+    samples: &[f32],
+    sample_rate: u32,
+) -> anyhow::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &sample in samples {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 // Cancel Action

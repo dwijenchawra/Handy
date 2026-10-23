@@ -64,15 +64,30 @@ impl FrameResampler {
     }
 
     pub fn finish(&mut self, mut emit: impl FnMut(&[f32])) {
-        // Process any remaining input samples
-        if let Some(ref mut resampler) = self.resampler {
-            if !self.in_buf.is_empty() {
-                // Pad with zeros to reach chunk size
-                self.in_buf.resize(self.chunk_in, 0.0);
-                if let Ok(out) = resampler.process(&[&self.in_buf[..]], None) {
-                    self.emit_frames(&out[0], &mut emit);
+        // Flush both the partial input and the FFT filter's delayed tail. Without
+        // zero-input draining, speech at release can remain inside the filter.
+        if self.resampler.is_some() {
+            self.in_buf.resize(self.chunk_in, 0.0);
+            let tail_blocks = {
+                let resampler = self.resampler.as_ref().unwrap();
+                resampler
+                    .output_delay()
+                    .div_ceil(resampler.output_frames_max())
+                    + 1
+            };
+            for _ in 0..=tail_blocks {
+                let output = self
+                    .resampler
+                    .as_mut()
+                    .unwrap()
+                    .process(&[&self.in_buf[..]], None);
+                if let Ok(output) = output {
+                    self.emit_frames(&output[0], &mut emit);
                 }
+                self.in_buf.fill(0.0);
             }
+            self.in_buf.clear();
+            self.resampler.as_mut().unwrap().reset();
         }
 
         // Emit any remaining pending frame (padded with zeros)
@@ -95,5 +110,21 @@ impl FrameResampler {
                 self.pending.clear();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_preserves_signal_at_end_of_full_input_block() {
+        let mut resampler = FrameResampler::new(48000, 16000, Duration::from_millis(30));
+        let mut input = vec![0.0; 1024];
+        input[1000..].fill(1.0);
+        let mut output = Vec::new();
+        resampler.push(&input, |frame| output.extend_from_slice(frame));
+        resampler.finish(|frame| output.extend_from_slice(frame));
+        assert!(output.iter().any(|sample| *sample > 0.5));
     }
 }
