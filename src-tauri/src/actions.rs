@@ -10,7 +10,6 @@ use crate::shortcut;
 use crate::tray::TrayIconState;
 use crate::utils::{self, show_recording_overlay, show_transcribing_overlay};
 use crate::TranscriptionCoordinator;
-use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use log::{debug, error, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -59,6 +58,15 @@ const TRANSCRIPTION_FIELD: &str = "transcription";
 /// Strip invisible Unicode characters that some LLMs may insert
 fn strip_invisible_chars(s: &str) -> String {
     s.replace(['\u{200B}', '\u{200C}', '\u{200D}', '\u{FEFF}'], "")
+}
+
+fn strip_think_block(s: &str) -> &str {
+    if let Some(rest) = s.trim_start().strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            return rest[end + "</think>".len()..].trim_start();
+        }
+    }
+    s
 }
 
 /// Build a system prompt from the user's prompt template.
@@ -228,8 +236,9 @@ async fn post_process_transcription(
         .await
         {
             Ok(Some(content)) => {
+                let content = strip_think_block(&content);
                 // Parse the JSON response to extract the transcription field
-                match serde_json::from_str::<serde_json::Value>(&content) {
+                match serde_json::from_str::<serde_json::Value>(content) {
                     Ok(json) => {
                         if let Some(transcription_value) =
                             json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
@@ -243,7 +252,7 @@ async fn post_process_transcription(
                             return Some(result);
                         } else {
                             error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(&content));
+                            return Some(strip_invisible_chars(content));
                         }
                     }
                     Err(e) => {
@@ -251,7 +260,7 @@ async fn post_process_transcription(
                             "Failed to parse structured output JSON: {}. Returning raw content.",
                             e
                         );
-                        return Some(strip_invisible_chars(&content));
+                        return Some(strip_invisible_chars(content));
                     }
                 }
             }
@@ -293,7 +302,7 @@ async fn post_process_transcription(
     .await
     {
         Ok(Some(content)) => {
-            let content = strip_invisible_chars(&content);
+            let content = strip_invisible_chars(strip_think_block(&content));
             debug!(
                 "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
                 provider.id,
@@ -316,50 +325,6 @@ async fn post_process_transcription(
     }
 }
 
-async fn maybe_convert_chinese_variant(
-    settings: &AppSettings,
-    transcription: &str,
-) -> Option<String> {
-    // Check if language is set to Simplified or Traditional Chinese
-    let is_simplified = settings.selected_language == "zh-Hans";
-    let is_traditional = settings.selected_language == "zh-Hant";
-
-    if !is_simplified && !is_traditional {
-        debug!("selected_language is not Simplified or Traditional Chinese; skipping translation");
-        return None;
-    }
-
-    debug!(
-        "Starting Chinese translation using OpenCC for language: {}",
-        settings.selected_language
-    );
-
-    // Use OpenCC to convert based on selected language
-    let config = if is_simplified {
-        // Convert Traditional Chinese to Simplified Chinese
-        BuiltinConfig::Tw2sp
-    } else {
-        // Convert Simplified Chinese to Traditional Chinese
-        BuiltinConfig::S2tw
-    };
-
-    match OpenCC::from_config(config) {
-        Ok(converter) => {
-            let converted = converter.convert(transcription);
-            debug!(
-                "OpenCC translation completed. Input length: {}, Output length: {}",
-                transcription.len(),
-                converted.len()
-            );
-            Some(converted)
-        }
-        Err(e) => {
-            error!("Failed to initialize OpenCC converter: {}. Falling back to original transcription.", e);
-            None
-        }
-    }
-}
-
 pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
@@ -371,6 +336,13 @@ pub(crate) async fn process_transcription_output(
     transcription: &str,
     post_process: bool,
 ) -> ProcessedTranscription {
+    if transcription.trim().is_empty() {
+        return ProcessedTranscription {
+            final_text: String::new(),
+            post_processed_text: None,
+            post_process_prompt: None,
+        };
+    }
     let settings = get_settings(app);
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
@@ -402,10 +374,6 @@ pub(crate) async fn process_transcription_output(
     } else {
         None
     };
-
-    if let Some(converted_text) = maybe_convert_chinese_variant(&settings, transcription).await {
-        final_text = converted_text;
-    }
 
     if post_process {
         if let Some(processed_text) =
