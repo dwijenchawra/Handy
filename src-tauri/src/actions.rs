@@ -7,7 +7,7 @@ use crate::managers::history::HistoryManager;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
-use crate::tray::{change_tray_icon, TrayIconState};
+use crate::tray::TrayIconState;
 use crate::utils::{self, show_recording_overlay, show_transcribing_overlay};
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
@@ -151,17 +151,7 @@ async fn post_process_transcription(
     // - custom: top-level reasoning_effort (works for local OpenAI-compat servers)
     // - openrouter: nested reasoning object; exclude:true also keeps reasoning text
     //   out of the response so it can't pollute structured-output JSON parsing
-    let (reasoning_effort, reasoning) = match provider.id.as_str() {
-        "custom" => (Some("none".to_string()), None),
-        "openrouter" => (
-            None,
-            Some(crate::llm_client::ReasoningConfig {
-                effort: Some("none".to_string()),
-                exclude: Some(true),
-            }),
-        ),
-        _ => (None, None),
-    };
+    let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
 
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
@@ -233,8 +223,7 @@ async fn post_process_transcription(
             user_content,
             Some(system_prompt),
             Some(json_schema),
-            reasoning_effort.clone(),
-            reasoning.clone(),
+            disable_reasoning,
         )
         .await
         {
@@ -299,8 +288,7 @@ async fn post_process_transcription(
         api_key,
         &model,
         processed_prompt,
-        reasoning_effort,
-        reasoning,
+        disable_reasoning,
     )
     .await
     {
@@ -466,9 +454,21 @@ impl ShortcutAction for TranscribeAction {
         let recording_error = rm.try_start_recording_at(binding_id, at).err();
         if recording_error.is_none() {
             rm.apply_mute();
-            change_tray_icon(app, TrayIconState::Recording);
-            show_recording_overlay(app);
-            if !get_settings(app).mute_while_recording {
+            crate::tray::set_tray_state(app, TrayIconState::Recording);
+            let settings = get_settings(app);
+            let streaming = !settings.remote_stt_enabled
+                && !app.state::<TranscriptionCoordinator>().has_pending()
+                && app
+                    .state::<Arc<crate::managers::model::ModelManager>>()
+                    .get_model_info(&settings.selected_model)
+                    .is_some_and(|model| model.supports_streaming);
+            if streaming {
+                crate::overlay::show_streaming_overlay(app);
+            } else {
+                show_recording_overlay(app);
+            }
+            crate::overlay::emit_recording_ready(app);
+            if !settings.mute_while_recording {
                 play_feedback_sound(app, SoundType::Start);
             }
         }
@@ -480,7 +480,7 @@ impl ShortcutAction for TranscribeAction {
             // Starting failed (for example due to blocked microphone permissions).
             // Revert UI state so we don't stay stuck in the recording overlay.
             utils::hide_recording_overlay(app);
-            change_tray_icon(app, TrayIconState::Idle);
+            crate::tray::set_tray_state(app, TrayIconState::Idle);
             if let Some(err) = recording_error {
                 let error_type = if is_microphone_access_denied(&err) {
                     "microphone_permission_denied"
@@ -532,7 +532,7 @@ impl ShortcutAction for TranscribeAction {
         shortcut::unregister_cancel_shortcut(app);
         rm.remove_mute();
         play_feedback_sound(app, SoundType::Stop);
-        change_tray_icon(app, TrayIconState::Transcribing);
+        crate::tray::set_tray_state(app, TrayIconState::Transcribing);
         show_transcribing_overlay(app);
 
         let ah = app.clone();
@@ -540,7 +540,7 @@ impl ShortcutAction for TranscribeAction {
         let benchmark_settings = crate::settings::get_settings(app);
         let compare = benchmark_settings.remote_stt_compare;
         CAPTURE_QUEUE.submit(move || {
-            let capture = match capture.recv() {
+            let mut capture = match capture.recv() {
                 Ok(capture) => capture,
                 Err(error) => {
                     error!("Capture worker disconnected: {error}");
@@ -562,8 +562,12 @@ impl ShortcutAction for TranscribeAction {
             let audio_saved = saved.is_ok();
             let audio_seconds = capture.samples.len() as f64 / capture.sample_rate as f64;
             let benchmark_recording = file_name.clone();
+            let mut live = capture.live.take();
+            let valid_live = live.as_ref().is_some_and(|live| live.valid());
+            let local_live = live.as_mut().and_then(|live| live.local.take()).filter(|_| valid_live);
+            let mut remote_live = live.as_mut().and_then(|live| live.remote.take()).filter(|_| valid_live);
             if compare && audio_saved {
-                crate::stt_benchmark::enqueue_remote(ah.clone(), wav_path.clone(), benchmark_settings.remote_stt_url.clone(), at, audio_seconds);
+                crate::stt_benchmark::enqueue_remote(ah.clone(), wav_path.clone(), benchmark_settings.remote_stt_url.clone(), at, audio_seconds, remote_live.take());
             }
             let history_entry = match saved {
                 Ok(()) => hm.save_pending_entry(file_name, post_process).map_err(|error| {
@@ -598,7 +602,11 @@ impl ShortcutAction for TranscribeAction {
                     };
                     let tm = Arc::clone(&ah.state::<Arc<TranscriptionManager>>());
                     let cold_model = !tm.is_model_loaded();
-                    let transcription_result = if compare {
+                    let live_result = crate::live_capture::usable_result(if compare || !benchmark_settings.remote_stt_enabled { local_live } else { remote_live });
+                    let live_finished = live_result.as_ref().map(|(_, finished)| *finished);
+                    let transcription_result = if let Some((text, _)) = live_result {
+                        Ok(text)
+                    } else if compare {
                         tm.initiate_local_model_load();
                         tm.transcribe_local(samples)
                     } else {
@@ -606,7 +614,7 @@ impl ShortcutAction for TranscribeAction {
                         tm.transcribe(samples)
                     };
                     if compare {
-                        crate::stt_benchmark::record(&ah, &benchmark_recording, ("local", &benchmark_settings.selected_model), (at, benchmark_started, Instant::now()), audio_seconds, cold_model, &transcription_result);
+                        crate::stt_benchmark::record(&ah, &benchmark_recording, ("local", &benchmark_settings.selected_model, live_finished.is_some()), (at, if live_finished.is_some() { at } else { benchmark_started }, live_finished.unwrap_or_else(Instant::now)), audio_seconds, cold_model, &transcription_result);
                     }
                     match transcription_result {
                         Ok(transcription) => {
@@ -633,7 +641,13 @@ impl ShortcutAction for TranscribeAction {
                                 }) {
                                     error!("Failed to schedule paste: {error}");
                                     let _ = ah.emit("paste-error", ());
-                                } else { let _ = done_rx.await; }
+                                } else {
+                                    let _ = done_rx.await;
+                                    if let Err(error) = crate::paste_tx::wait_for_completion() {
+                                        error!("{error}");
+                                        let _ = ah.emit("paste-error", ());
+                                    }
+                                }
                             }
                         }
                         Err(error) => {

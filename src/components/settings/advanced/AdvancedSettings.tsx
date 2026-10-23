@@ -20,6 +20,8 @@ import { ExperimentalToggle } from "../ExperimentalToggle";
 import { useSettings } from "../../../hooks/useSettings";
 import { KeyboardImplementationSelector } from "../debug/KeyboardImplementationSelector";
 import { AccelerationSelector } from "../AccelerationSelector";
+import { FillerWordRemoval } from "../FillerWordRemoval";
+import { ChineseScriptSetting } from "../ChineseScript";
 
 export const AdvancedSettings: React.FC = () => {
   const { t } = useTranslation();
@@ -45,6 +47,8 @@ export const AdvancedSettings: React.FC = () => {
       </SettingsGroup>
 
       <SettingsGroup title={t("settings.advanced.groups.transcription")}>
+        <FillerWordRemoval descriptionMode="tooltip" grouped={true} />
+        <ChineseScriptSetting descriptionMode="tooltip" grouped={true} />
         <RemoteStt />
         <CustomWords descriptionMode="tooltip" grouped />
         <AppendTrailingSpace descriptionMode="tooltip" grouped={true} />

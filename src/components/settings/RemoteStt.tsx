@@ -13,6 +13,7 @@ interface BenchmarkRow {
   e2e_ms: number;
   audio_seconds: number;
   cold_model: boolean;
+  streaming?: boolean;
   success: boolean;
   error: string | null;
 }
@@ -126,7 +127,8 @@ export function RemoteStt() {
                     {row.recording.replace("handy-", "").replace(".wav", "")}
                   </td>
                   <td className="p-2" title={row.model}>
-                    {t(`settings.remoteStt.${row.backend}`)}
+                    {t(`settings.remoteStt.${row.backend}`)}{" "}
+                    {row.streaming && t("settings.remoteStt.streaming")}
                   </td>
                   <td className="p-2">{(row.e2e_ms / 1000).toFixed(2)}</td>
                   <td className="p-2">{(row.queue_ms / 1000).toFixed(2)}</td>

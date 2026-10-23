@@ -13,6 +13,10 @@ use tauri::Manager;
 
 static REMOTE_QUEUE: Lazy<crate::serial_queue::SerialQueue> =
     Lazy::new(|| crate::serial_queue::SerialQueue::new("remote-benchmark"));
+pub fn remote_idle() -> bool {
+    REMOTE_QUEUE.is_idle()
+}
+
 static REPORT_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Serialize, Deserialize, specta::Type)]
@@ -25,6 +29,8 @@ pub struct BenchmarkResult {
     e2e_ms: f64,
     audio_seconds: f64,
     cold_model: bool,
+    #[serde(default)]
+    streaming: bool,
     success: bool,
     error: Option<String>,
 }
@@ -36,13 +42,13 @@ fn report_path(app: &tauri::AppHandle) -> Result<PathBuf> {
 pub fn record(
     app: &tauri::AppHandle,
     recording: &str,
-    backend: (&str, &str),
+    backend: (&str, &str, bool),
     timing: (Instant, Instant, Instant),
     audio_seconds: f64,
     cold_model: bool,
     result: &Result<String>,
 ) {
-    let (backend, model) = backend;
+    let (backend, model, streaming) = backend;
     let (released, started, finished) = timing;
     let row = BenchmarkResult {
         recording: recording.to_owned(),
@@ -53,6 +59,7 @@ pub fn record(
         e2e_ms: finished.duration_since(released).as_secs_f64() * 1000.0,
         audio_seconds,
         cold_model,
+        streaming,
         success: result.is_ok(),
         error: result.as_ref().err().map(ToString::to_string),
     };
@@ -89,6 +96,7 @@ pub fn enqueue_remote(
     endpoint: String,
     released: Instant,
     audio_seconds: f64,
+    live: Option<std::sync::mpsc::Receiver<crate::live_capture::Outcome>>,
 ) {
     // Retain an independent hard link so local history cleanup cannot delete
     // audio that is still waiting in the slower remote queue.
@@ -103,7 +111,7 @@ pub fn enqueue_remote(
             record(
                 &app,
                 &path.file_name().unwrap_or_default().to_string_lossy(),
-                ("remote", &endpoint),
+                ("remote", &endpoint, false),
                 (released, now, now),
                 audio_seconds,
                 false,
@@ -114,9 +122,16 @@ pub fn enqueue_remote(
     };
     REMOTE_QUEUE.submit(move || {
         let started = Instant::now();
-        let result = crate::audio_toolkit::read_wav_samples(&retained)
-            .and_then(|samples| crate::remote_stt::transcribe(&endpoint, &samples));
-        let finished = Instant::now();
+        let live_result = crate::live_capture::usable_result(live);
+        let streaming = live_result.is_some();
+        let (result, finished) = match live_result {
+            Some((text, finished)) => (Ok(text), finished),
+            None => {
+                let result = crate::audio_toolkit::read_wav_samples(&retained)
+                    .and_then(|samples| crate::remote_stt::transcribe(&endpoint, &samples));
+                (result, Instant::now())
+            }
+        };
         if let Err(error) = std::fs::remove_file(&retained) {
             log::warn!("Could not remove benchmark audio link: {error}");
         }
@@ -124,8 +139,12 @@ pub fn enqueue_remote(
         record(
             &app,
             &recording,
-            ("remote", &endpoint),
-            (released, started, finished),
+            ("remote", &endpoint, streaming),
+            (
+                released,
+                if streaming { released } else { started },
+                finished,
+            ),
             audio_seconds,
             false,
             &result,

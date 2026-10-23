@@ -18,7 +18,8 @@ enum Command {
         binding_id: String,
         hotkey_string: String,
         is_pressed: bool,
-        push_to_talk: bool,
+        activation: crate::settings::ShortcutActivation,
+        hold_threshold: Duration,
         at: Instant,
     },
     Cancel,
@@ -52,6 +53,7 @@ impl TranscriptionCoordinator {
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut stage = Stage::Idle;
+                let mut hybrid_press: Option<(String, Instant)> = None;
                 let mut last_press: Option<Instant> = None;
 
                 while let Ok(cmd) = rx.recv() {
@@ -60,9 +62,41 @@ impl TranscriptionCoordinator {
                             binding_id,
                             hotkey_string,
                             is_pressed,
-                            push_to_talk,
+                            activation,
+                            hold_threshold,
                             at,
                         } => {
+                            let push_to_talk =
+                                activation == crate::settings::ShortcutActivation::PushToTalk;
+                            if activation == crate::settings::ShortcutActivation::HoldOrToggle {
+                                if is_pressed {
+                                    match &stage {
+                                        Stage::Idle => {
+                                            start(
+                                                &app,
+                                                &mut stage,
+                                                &binding_id,
+                                                &hotkey_string,
+                                                at,
+                                            );
+                                            hybrid_press = Some((binding_id.clone(), at));
+                                        }
+                                        Stage::Recording(id)
+                                            if id == &binding_id && hybrid_press.is_none() =>
+                                        {
+                                            stop(&app, &mut stage, &binding_id, &hotkey_string, at);
+                                        }
+                                        _ => {}
+                                    }
+                                } else if let Some((id, pressed)) = hybrid_press.take() {
+                                    if id == binding_id
+                                        && at.saturating_duration_since(pressed) >= hold_threshold
+                                    {
+                                        stop(&app, &mut stage, &binding_id, &hotkey_string, at);
+                                    }
+                                }
+                                continue;
+                            }
                             // Debounce rapid-fire press events (key repeat / double-tap).
                             // Releases always pass through for push-to-talk.
                             if is_pressed && !push_to_talk {
@@ -99,6 +133,7 @@ impl TranscriptionCoordinator {
                         Command::Cancel => {
                             crate::utils::cancel_recording_now(&app);
                             stage = Stage::Idle;
+                            hybrid_press = None;
                             if pending_worker.load(Ordering::SeqCst) > 0 {
                                 crate::utils::show_transcribing_overlay(&app);
                             }
@@ -109,7 +144,7 @@ impl TranscriptionCoordinator {
                             if !app.state::<Arc<AudioRecordingManager>>().is_recording() {
                                 if pending_worker.load(Ordering::SeqCst) == 0 {
                                     crate::utils::hide_recording_overlay(&app);
-                                    crate::tray::change_tray_icon(
+                                    crate::tray::set_tray_state(
                                         &app,
                                         crate::tray::TrayIconState::Idle,
                                     );
@@ -137,7 +172,8 @@ impl TranscriptionCoordinator {
         binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
-        push_to_talk: bool,
+        activation: crate::settings::ShortcutActivation,
+        hold_threshold: Duration,
     ) {
         if self
             .tx
@@ -145,7 +181,8 @@ impl TranscriptionCoordinator {
                 binding_id: binding_id.to_string(),
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
-                push_to_talk,
+                activation,
+                hold_threshold,
                 at: Instant::now(),
             })
             .is_err()
@@ -154,10 +191,24 @@ impl TranscriptionCoordinator {
         }
     }
 
+    pub fn send_external_input(&self, binding_id: &str, source: &str) {
+        self.send_input(
+            binding_id,
+            source,
+            true,
+            crate::settings::ShortcutActivation::Toggle,
+            Duration::ZERO,
+        );
+    }
+
     pub fn notify_cancel(&self) {
         if self.tx.send(Command::Cancel).is_err() {
             warn!("Transcription coordinator channel closed");
         }
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0
     }
 
     pub fn begin_processing(&self) {

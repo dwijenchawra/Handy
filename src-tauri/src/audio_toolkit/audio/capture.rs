@@ -7,6 +7,7 @@ pub struct CapturedAudio {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub error: Option<String>,
+    pub live: Option<crate::live_capture::Results>,
 }
 
 struct Chunk {
@@ -22,6 +23,8 @@ struct Session {
     spans: Vec<(Instant, usize, usize)>,
     last_end: Option<Instant>,
     error: Option<String>,
+    live: Option<crate::live_capture::LiveCapture>,
+    live_cursor: usize,
 }
 
 /// Retain a small in-memory pre-roll to cover scheduling latency between the
@@ -55,6 +58,8 @@ impl CaptureBuffer {
             spans: Vec::new(),
             last_end: None,
             error: None,
+            live: None,
+            live_cursor: 0,
         };
         if self.recent.front().is_some_and(|chunk| chunk.at > at) {
             session.error = Some("Microphone was not ready at the start of the recording".into());
@@ -63,6 +68,13 @@ impl CaptureBuffer {
             append(&mut session, chunk, self.rate);
         }
         self.active = Some(session);
+    }
+
+    pub fn start_live(&mut self, at: Instant, live: crate::live_capture::LiveCapture) {
+        self.start(at);
+        if let Some(session) = &mut self.active {
+            session.live = Some(live);
+        }
     }
 
     pub fn stop(&mut self, at: Instant, reply: Sender<CapturedAudio>) {
@@ -85,6 +97,7 @@ impl CaptureBuffer {
                 samples: Vec::new(),
                 sample_rate: self.rate,
                 error: Some("No active recording".into()),
+                live: None,
             });
         }
     }
@@ -94,6 +107,14 @@ impl CaptureBuffer {
         let chunk = Chunk { at, samples };
         if let Some(session) = &mut self.active {
             append(session, &chunk, self.rate);
+            if let Some(live) = &session.live {
+                // Keep a short tail until the timestamped release is known.
+                let stable = session.samples.len().saturating_sub(self.rate as usize / 4);
+                if stable > session.live_cursor {
+                    live.feed(&session.samples[session.live_cursor..stable], self.rate);
+                    session.live_cursor = stable;
+                }
+            }
         }
         for session in &mut self.pending {
             append(session, &chunk, self.rate);
@@ -137,8 +158,17 @@ impl CaptureBuffer {
                         "Microphone stopped delivering audio before the recording ended".into(),
                     );
                 }
+                let live = session.live.take().map(|live| {
+                    let valid =
+                        session.live_cursor <= session.samples.len() && session.error.is_none();
+                    if valid {
+                        live.feed(&session.samples[session.live_cursor..], self.rate);
+                    }
+                    live.finish(valid)
+                });
                 if let Some(reply) = session.reply {
                     let _ = reply.send(CapturedAudio {
+                        live,
                         samples: session.samples,
                         sample_rate: self.rate,
                         error: session.error,
@@ -271,5 +301,48 @@ mod tests {
         let capture = rx.recv().unwrap();
         assert_eq!(capture.samples, vec![1.0; 10]);
         assert_eq!(capture.error.as_deref(), Some("device disconnected"));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn live_feed_matches_exact_saved_interval_including_tail() {
+        let base = Instant::now();
+        let mut buffer = CaptureBuffer::new(1000);
+        buffer.samples(base, (0..100).map(|x| x as f32).collect());
+        let (live, observed) = crate::live_capture::test_capture();
+        buffer.start_live(base + Duration::from_millis(20), live);
+        buffer.samples(
+            base + Duration::from_millis(100),
+            (100..1000).map(|x| x as f32).collect(),
+        );
+        let (tx, rx) = mpsc::channel();
+        buffer.stop(base + Duration::from_millis(900), tx);
+        let captured = rx.recv().unwrap();
+        assert!(captured.live.as_ref().unwrap().valid());
+        let streamed: Vec<f32> = observed.into_iter().flatten().collect();
+        assert_eq!(streamed, captured.samples);
+        assert_eq!(streamed, (20..900).map(|x| x as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn very_late_release_invalidates_speculative_stream_without_losing_capture() {
+        let base = Instant::now();
+        let mut buffer = CaptureBuffer::new(1000);
+        let (live, _observed) = crate::live_capture::test_capture();
+        buffer.start_live(base, live);
+        buffer.samples(base, (0..1000).map(|x| x as f32).collect());
+        let (tx, rx) = mpsc::channel();
+        buffer.stop(base + Duration::from_millis(50), tx);
+        let captured = rx.recv().unwrap();
+        assert!(!captured.live.as_ref().unwrap().valid());
+        assert_eq!(
+            captured.samples,
+            (0..50).map(|x| x as f32).collect::<Vec<_>>()
+        );
     }
 }

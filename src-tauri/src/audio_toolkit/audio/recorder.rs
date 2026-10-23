@@ -1,7 +1,7 @@
 use std::{
     io::Error,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -23,6 +23,7 @@ use super::capture::{CaptureBuffer, CapturedAudio};
 
 enum Cmd {
     Start(Instant),
+    StartLive(Instant, crate::live_capture::LiveCapture),
     Stop(Instant, mpsc::Sender<CapturedAudio>),
     Samples(Instant, Vec<f32>),
     StreamError(String),
@@ -31,6 +32,7 @@ enum Cmd {
 
 pub struct AudioRecorder {
     healthy: Arc<AtomicBool>,
+    selected_channel: Option<usize>,
     device: Option<Device>,
     cmd_tx: Option<mpsc::Sender<Cmd>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
@@ -40,9 +42,16 @@ pub struct AudioRecorder {
 }
 
 impl AudioRecorder {
+    pub fn preferred_input_channel_count(
+        device: &Device,
+    ) -> Result<u16, Box<dyn std::error::Error>> {
+        Ok(Self::get_preferred_config(device)?.channels())
+    }
+
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(AudioRecorder {
             healthy: Arc::new(AtomicBool::new(false)),
+            selected_channel: None,
             device: None,
             cmd_tx: None,
             worker_handle: None,
@@ -50,6 +59,10 @@ impl AudioRecorder {
             level_cb: None,
             error_cb: None,
         })
+    }
+
+    pub fn set_selected_channel(&mut self, channel: Option<u16>) {
+        self.selected_channel = channel.map(usize::from);
     }
 
     pub fn with_vad(mut self, vad: Box<dyn VoiceActivityDetector>) -> Self {
@@ -92,6 +105,7 @@ impl AudioRecorder {
         let error_cb = self.error_cb.clone();
 
         let sample_tx = cmd_tx.clone();
+        let selected_channel = self.selected_channel;
         let healthy = self.healthy.clone();
         let worker = std::thread::spawn(move || {
             let init_result = (|| -> Result<(cpal::Stream, u32), String> {
@@ -115,6 +129,7 @@ impl AudioRecorder {
                         &config,
                         sample_tx,
                         channels,
+                        selected_channel,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I8 => AudioRecorder::build_stream::<i8>(
@@ -122,6 +137,7 @@ impl AudioRecorder {
                         &config,
                         sample_tx,
                         channels,
+                        selected_channel,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I16 => AudioRecorder::build_stream::<i16>(
@@ -129,6 +145,7 @@ impl AudioRecorder {
                         &config,
                         sample_tx,
                         channels,
+                        selected_channel,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I32 => AudioRecorder::build_stream::<i32>(
@@ -136,6 +153,7 @@ impl AudioRecorder {
                         &config,
                         sample_tx,
                         channels,
+                        selected_channel,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::F32 => AudioRecorder::build_stream::<f32>(
@@ -143,6 +161,7 @@ impl AudioRecorder {
                         &config,
                         sample_tx,
                         channels,
+                        selected_channel,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     sample_format => {
@@ -202,6 +221,21 @@ impl AudioRecorder {
 
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn start_live(
+        &self,
+        at: Instant,
+        live: crate::live_capture::LiveCapture,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.is_healthy() {
+            return Err("Microphone is not delivering audio".into());
+        }
+        self.cmd_tx
+            .as_ref()
+            .ok_or("Microphone is not open")?
+            .send(Cmd::StartLive(at, live))?;
+        Ok(())
     }
 
     pub fn start_at(&self, at: Instant) -> Result<(), Box<dyn std::error::Error>> {
@@ -275,14 +309,51 @@ impl AudioRecorder {
         config: &cpal::SupportedStreamConfig,
         sample_tx: mpsc::Sender<Cmd>,
         channels: usize,
+        selected_channel: Option<usize>,
     ) -> Result<cpal::Stream, cpal::BuildStreamError>
     where
         T: Sample + SizedSample + Send + 'static,
         f32: cpal::FromSample<T>,
     {
+        const BLOCK: usize = 512;
+        struct Packet {
+            at: Instant,
+            len: usize,
+            samples: [f32; BLOCK],
+        }
+        // Preallocate outside CoreAudio's callback. Capacity also accommodates
+        // small hardware callbacks without depending on callback buffer size.
+        let capacity = (config.sample_rate().0 as usize * 2 / 64).max(128);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<Packet>::new(capacity);
+        let overruns = Arc::new(AtomicU64::new(0));
+        let callback_overruns = overruns.clone();
         let error_tx = sample_tx.clone();
+        std::thread::spawn(move || loop {
+            let lost = overruns.swap(0, Ordering::AcqRel);
+            if lost > 0 {
+                let _ = sample_tx.send(Cmd::StreamError(format!(
+                    "Microphone transport overrun: {lost} samples lost"
+                )));
+            }
+            while let Ok(packet) = consumer.pop() {
+                if sample_tx
+                    .send(Cmd::Samples(
+                        packet.at,
+                        packet.samples[..packet.len].to_vec(),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if consumer.is_abandoned() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let rate = config.sample_rate().0 as f64;
+        let selected_channel = selected_channel.filter(|channel| *channel < channels);
         let stream_cb = move |data: &[T], info: &cpal::InputCallbackInfo| {
-            // Map the device capture clock to the shortcut's monotonic clock.
             let timestamp = info.timestamp();
             let latency = timestamp
                 .callback
@@ -290,31 +361,27 @@ impl AudioRecorder {
                 .unwrap_or_default();
             let now = Instant::now();
             let captured_at = now.checked_sub(latency).unwrap_or(now);
-            // Move one owned buffer to the consumer instead of filling a scratch
-            // buffer and cloning every microphone callback.
-            let mut output_buffer = Vec::with_capacity(data.len() / channels);
-
-            if channels == 1 {
-                output_buffer.extend(data.iter().map(|&sample| sample.to_sample::<f32>()));
-            } else {
-                let frame_count = data.len() / channels;
-                output_buffer.reserve(frame_count);
-
-                for frame in data.chunks_exact(channels) {
-                    let mono_sample = frame
-                        .iter()
-                        .map(|&sample| sample.to_sample::<f32>())
-                        .sum::<f32>()
-                        / channels as f32;
-                    output_buffer.push(mono_sample);
+            for (block_index, block) in data.chunks(BLOCK * channels).enumerate() {
+                let mut packet = Packet {
+                    at: captured_at + Duration::from_secs_f64((block_index * BLOCK) as f64 / rate),
+                    len: block.len() / channels,
+                    samples: [0.0; BLOCK],
+                };
+                for (index, frame) in block.chunks_exact(channels).enumerate() {
+                    packet.samples[index] = if let Some(channel) = selected_channel {
+                        frame[channel].to_sample::<f32>()
+                    } else {
+                        frame
+                            .iter()
+                            .map(|sample| sample.to_sample::<f32>())
+                            .sum::<f32>()
+                            / channels as f32
+                    };
                 }
-            }
-
-            if sample_tx
-                .send(Cmd::Samples(captured_at, output_buffer))
-                .is_err()
-            {
-                log::error!("Failed to send samples");
+                let len = packet.len;
+                if producer.push(packet).is_err() {
+                    callback_overruns.fetch_add(len as u64, Ordering::Relaxed);
+                }
             }
         };
 
@@ -459,6 +526,12 @@ fn run_consumer(
     let mut visualizer = AudioVisualiser::new(sample_rate, 512, 16, 400.0, 4000.0);
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Cmd::StartLive(at, live)) => {
+                capture.start_live(at, live);
+                recording = true;
+                last_visualization = None;
+                visualizer.reset();
+            }
             Ok(Cmd::Start(at)) => {
                 capture.start(at);
                 recording = true;

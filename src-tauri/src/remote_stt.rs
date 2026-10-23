@@ -47,10 +47,69 @@ pub fn transcribe(url: &str, audio: &[f32]) -> Result<String> {
     })
 }
 
+pub enum LiveInput {
+    Samples(Vec<f32>),
+    Finish(bool),
+}
+
+pub fn start_live(
+    url: String,
+    reply: std::sync::mpsc::Sender<crate::live_capture::Outcome>,
+) -> tokio::sync::mpsc::Sender<LiveInput> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    std::thread::spawn(move || {
+        let result = (|| -> Result<Option<String>> {
+            let Ok(_session) = REMOTE_SESSION.try_lock() else {
+                return Ok(None);
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let input =
+                    futures_util::stream::unfold((rx, false), |(mut rx, done)| async move {
+                        if done {
+                            return None;
+                        }
+                        match rx.recv().await {
+                            Some(LiveInput::Samples(samples)) => Some((Ok(samples), (rx, false))),
+                            Some(LiveInput::Finish(true)) => None,
+                            _ => Some((
+                                Err(anyhow::anyhow!(
+                                    "Live audio was interrupted; use saved recording"
+                                )),
+                                (rx, true),
+                            )),
+                        }
+                    });
+                recognize(&url, input).await.map(Some)
+            })
+        })();
+        let _ = reply.send(crate::live_capture::Outcome {
+            result,
+            finished: std::time::Instant::now(),
+        });
+    });
+    tx
+}
+
 async fn transcribe_async(url: &str, audio: &[f32]) -> Result<String> {
     if audio.is_empty() {
         return Ok(String::new());
     }
+    let input = futures_util::stream::iter(audio.chunks(1600).map(|chunk| Ok(chunk.to_vec())));
+    tokio::time::timeout(
+        Duration::from_secs_f64(audio.len() as f64 / 16000.0 + 120.0),
+        recognize(url, input),
+    )
+    .await
+    .context("Remote STT timed out; recording retained")?
+}
+
+async fn recognize<S>(url: &str, input: S) -> Result<String>
+where
+    S: futures_util::Stream<Item = Result<Vec<f32>>>,
+{
     let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15), connect_async(url))
         .await
         .context("Remote STT connection timed out")??;
@@ -74,15 +133,20 @@ async fn transcribe_async(url: &str, audio: &[f32]) -> Result<String> {
     }
     let (mut sink, mut stream) = socket.split();
     let send = async {
-        // 100 ms of mono float32 PCM: 6,400 bytes, safely below the 64 KB limit.
-        // Completed audio can be uploaded immediately. Socket backpressure
-        // bounds transmission without adding the recording duration as latency.
-        for chunk in audio.chunks(1600) {
-            let bytes: Vec<u8> = chunk
-                .iter()
-                .flat_map(|sample| sample.to_le_bytes())
-                .collect();
-            sink.send(Message::Binary(bytes.into())).await?;
+        futures_util::pin_mut!(input);
+        while let Some(samples) = input.next().await {
+            for chunk in samples?.chunks(1600) {
+                let bytes: Vec<u8> = chunk
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect();
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    sink.send(Message::Binary(bytes.into())),
+                )
+                .await
+                .context("Remote audio send stalled")??;
+            }
         }
         sink.send(Message::Text("stop".into())).await?;
         Ok::<(), anyhow::Error>(())
@@ -112,11 +176,18 @@ async fn transcribe_async(url: &str, audio: &[f32]) -> Result<String> {
         }
         bail!("Remote STT disconnected before completion; recording retained")
     };
-    let deadline = Duration::from_secs_f64(audio.len() as f64 / 16000.0 + 120.0);
-    let (_, text) = tokio::time::timeout(deadline, async { tokio::try_join!(send, receive) })
-        .await
-        .context("Remote STT timed out; recording retained")??;
-    Ok(text)
+    tokio::pin!(send);
+    tokio::pin!(receive);
+    tokio::select! {
+        sent = &mut send => {
+            sent?;
+            tokio::time::timeout(Duration::from_secs(120), receive).await.context("Remote final transcript timed out")?
+        }
+        result = &mut receive => {
+            result?;
+            bail!("Remote STT finished before all audio was sent")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +262,72 @@ mod tests {
     fn live_server_silence() {
         let result = transcribe("wss://stt.dwijen.dev/stream", &vec![0.0; 16000]);
         assert!(result.is_ok(), "{result:?}");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn sends_audio_before_release_and_does_not_accept_partial_as_final() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("ws://{}", listener.local_addr().unwrap());
+                let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    ws.send(Message::Text(
+                        r#"{"ready":true,"sample_rate":16000}"#.into(),
+                    ))
+                    .await
+                    .unwrap();
+                    let Message::Binary(bytes) = ws.next().await.unwrap().unwrap() else {
+                        panic!("audio expected before release")
+                    };
+                    assert_eq!(bytes.as_ref(), 0.25f32.to_le_bytes());
+                    ws.send(Message::Text(r#"{"text":"partial"}"#.into()))
+                        .await
+                        .unwrap();
+                    seen_tx.send(()).unwrap();
+                    let Message::Binary(bytes) = ws.next().await.unwrap().unwrap() else {
+                        panic!("tail expected")
+                    };
+                    assert_eq!(bytes.as_ref(), 0.5f32.to_le_bytes());
+                    assert_eq!(
+                        ws.next().await.unwrap().unwrap(),
+                        Message::Text("stop".into())
+                    );
+                    ws.send(Message::Text(
+                        r#"{"text":"final text","final":true}"#.into(),
+                    ))
+                    .await
+                    .unwrap();
+                    ws.send(Message::Text(r#"{"done":true}"#.into()))
+                        .await
+                        .unwrap();
+                });
+                let (tx, rx) = tokio::sync::mpsc::channel::<Vec<f32>>(4);
+                let input = futures_util::stream::unfold(rx, |mut rx| async {
+                    rx.recv().await.map(|samples| (Ok(samples), rx))
+                });
+                let recording = async {
+                    tx.send(vec![0.25]).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), seen_rx)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    tx.send(vec![0.5]).await.unwrap();
+                    drop(tx);
+                };
+                let (result, _) = tokio::join!(recognize(&url, input), recording);
+                assert_eq!(result.unwrap(), "final text");
+                server.await.unwrap();
+            });
     }
 }

@@ -283,6 +283,7 @@ impl AudioRecordingManager {
 
         let mut recorder_opt = self.recorder.lock().unwrap();
         if let Some(rec) = recorder_opt.as_mut() {
+            rec.set_selected_channel(settings.selected_channel);
             rec.open(selected_device)
                 .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;
         }
@@ -341,7 +342,10 @@ impl AudioRecordingManager {
             }
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                match rec.start_at(at) {
+                match rec.start_live(
+                    at,
+                    crate::live_capture::LiveCapture::new(self.app_handle.clone()),
+                ) {
                     Ok(()) => {
                         *self.is_recording.lock().unwrap() = true;
                         *state = RecordingState::Recording {
@@ -357,6 +361,18 @@ impl AudioRecordingManager {
         } else {
             Err("Already recording".to_string())
         }
+    }
+
+    pub fn update_selected_channel(&self, _channel: Option<u16>) -> Result<(), anyhow::Error> {
+        self.update_selected_device()
+    }
+
+    pub fn update_vad_backend(
+        &self,
+        _backend: crate::settings::VadBackend,
+    ) -> Result<(), anyhow::Error> {
+        // Original PCM is intentionally never filtered by VAD in this fork.
+        Ok(())
     }
 
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
