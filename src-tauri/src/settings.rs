@@ -351,6 +351,10 @@ pub struct AppSettings {
     pub update_checks_enabled: bool,
     #[serde(default = "default_model")]
     pub selected_model: String,
+    #[serde(default)]
+    pub remote_stt_enabled: bool,
+    #[serde(default)]
+    pub remote_stt_url: String,
     #[serde(default = "default_always_on_microphone")]
     pub always_on_microphone: bool,
     #[serde(default)]
@@ -776,6 +780,8 @@ pub fn get_default_settings() -> AppSettings {
         autostart_enabled: default_autostart_enabled(),
         update_checks_enabled: default_update_checks_enabled(),
         selected_model: "".to_string(),
+        remote_stt_enabled: false,
+        remote_stt_url: String::new(),
         always_on_microphone: false,
         selected_microphone: None,
         clamshell_microphone: None,

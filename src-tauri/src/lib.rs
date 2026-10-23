@@ -15,6 +15,7 @@ mod macos_mute;
 mod managers;
 mod overlay;
 pub mod portable;
+mod remote_stt;
 mod serial_queue;
 mod settings;
 mod shortcut;
@@ -369,6 +370,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_lazy_stream_close_setting,
             shortcut::change_app_language_setting,
             shortcut::change_use_accessibility_context_setting,
+            remote_stt::set_remote_stt,
             shortcut::change_update_checks_setting,
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,

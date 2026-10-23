@@ -542,6 +542,14 @@
           "details": "Handy uses Whisper.cpp for fast, local speech-to-text processing. Thanks to the amazing work by Georgi Gerganov and contributors."
         }
       }
+    },
+    "remoteStt": {
+      "label": "Remote speech recognition (experimental)",
+      "description": "Send completed recordings to your WebSocket STT server. Audio stays saved locally for retry. Upload runs at real-time speed; local model options do not apply. Changes apply when the next queued recording starts processing.",
+      "enable": "Save and use remote server",
+      "disable": "Use local model",
+      "remoteActive": "Remote recognition enabled",
+      "localActive": "Local recognition enabled"
     }
   },
   "footer": {
