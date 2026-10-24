@@ -56,6 +56,9 @@ pub(crate) const QUIET_PERIOD: Duration = Duration::from_millis(200);
 /// restore regardless of receipts. Long enough that a realistically loaded
 /// target always gets to read first; short enough that a lost keystroke does
 /// not strand the transcript on the clipboard for long.
+#[cfg(target_os = "macos")]
+pub(crate) const RESTORE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(target_os = "macos"))]
 pub(crate) const RESTORE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// When the chord could not be injected at all, no legitimate receipt can
@@ -282,13 +285,13 @@ mod tests {
     }
 }
 
-pub(crate) fn wait_for_completion() -> Result<(), String> {
+pub(crate) fn wait_for_completion() -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
         platform::wait_for_completion()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(())
+        Ok(true)
     }
 }

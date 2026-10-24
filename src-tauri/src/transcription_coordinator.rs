@@ -143,7 +143,7 @@ impl TranscriptionCoordinator {
                             // A finished job must never reset a newer recording.
                             if !app.state::<Arc<AudioRecordingManager>>().is_recording() {
                                 if pending_worker.load(Ordering::SeqCst) == 0 {
-                                    crate::utils::hide_recording_overlay(&app);
+                                    crate::delivery::refresh_overlay(&app);
                                     crate::tray::set_tray_state(
                                         &app,
                                         crate::tray::TrayIconState::Idle,

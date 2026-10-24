@@ -158,7 +158,7 @@ fn settle(
         !ownership_lost && NSPasteboard::generalPasteboard().changeCount() == p.change_count;
     if !still_ours {
         info!("[reliable-paste] clipboard changed externally; leaving it untouched");
-    } else if p.preserve_transcript {
+    } else if p.preserve_transcript || !receipt_seen {
         // The user asked for the transcript to stay on the clipboard: replace
         // the concealed promise with plain text so clipboard managers record
         // it and it survives this app exiting.
@@ -337,22 +337,27 @@ pub(super) fn run(
 
 /// Called only on the serial output worker, never on AppKit's main thread.
 /// Keep a later dictation from replacing a pasteboard promise before consumption.
-pub(super) fn wait_for_completion() -> Result<(), String> {
+pub(super) fn wait_for_completion() -> Result<bool, String> {
     let pending = PENDING
         .lock()
         .map_err(|_| "Paste state lock poisoned")?
         .clone();
     let Some(pending) = pending else {
-        return Ok(());
+        return Ok(true);
     };
     let deadline = Instant::now() + super::RESTORE_TIMEOUT + Duration::from_secs(2);
     loop {
-        if pending
-            .lock()
-            .map_err(|_| "Paste transaction lock poisoned")?
-            .settled
         {
-            return Ok(());
+            let p = pending
+                .lock()
+                .map_err(|_| "Paste transaction lock poisoned")?;
+            if p.settled {
+                return p
+                    .state
+                    .lock()
+                    .map(|s| s.any_receipt_after_injection())
+                    .map_err(|_| "Paste receipt lock poisoned".to_string());
+            }
         }
         if Instant::now() >= deadline {
             return Err("Timed out settling clipboard paste; transcript remains in History".into());

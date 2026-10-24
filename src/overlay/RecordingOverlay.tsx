@@ -12,7 +12,13 @@ import type {
 import i18n, { syncLanguageFromSettings } from "@/i18n";
 import { getLanguageDirection } from "@/lib/utils/rtl";
 
-type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
+type OverlayState =
+  | "recording"
+  | "streaming"
+  | "transcribing"
+  | "processing"
+  | "pasting"
+  | "delivery_ready";
 
 // Number of reactive bars in the waveform (the simple, smoothed style shared by
 // every overlay form). Mic levels arrive as 16 FFT buckets; we take the first N.
@@ -235,6 +241,31 @@ const RecordingOverlay: React.FC = () => {
       <div className="sbase-r">{showCancel && cancelBtn}</div>
     </div>
   );
+
+  if (state === "pasting" || state === "delivery_ready") {
+    return (
+      <div
+        dir={direction}
+        className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
+      >
+        <div className="scard compact cworking" style={{ width: 340 }}>
+          <div className="sbase">
+            <div className="sbase-l">
+              {state === "pasting" && <span className="sspinner" />}
+            </div>
+            <span className="swork-label">
+              {t(
+                state === "pasting"
+                  ? "delivery.pasting"
+                  : "delivery.overlayReady",
+              )}
+            </span>
+            <div className="sbase-r" />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ---- Live overlay: a pill that sculpts open into a panel ----
   if (state === "streaming") {

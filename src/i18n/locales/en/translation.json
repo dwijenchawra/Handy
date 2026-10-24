@@ -754,5 +754,15 @@
     "learnMore": "How to fix",
     "recorderBlocked": "Can't record shortcuts right now — macOS Secure Input is blocking key events. Resolve the Secure Input warning first.",
     "dismiss": "Dismiss"
+  },
+  "delivery": {
+    "pasting": "Pasting…",
+    "ready": "Text ready to paste",
+    "overlayReady": "Text ready — copy from Handy",
+    "instructions": "{{count}} result(s) waiting. Copy and paste the oldest result, then mark it done to move to the next. Recordings can continue.",
+    "copy": "Copy",
+    "retry": "Retry paste",
+    "done": "Done / next",
+    "retryHint": "Retry hides Handy and pastes into the previous app. Only retry if the text was not already inserted."
   }
 }

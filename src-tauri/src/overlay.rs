@@ -55,7 +55,9 @@ const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 
 /// Overlay window size (logical) for a given UI state.
 fn overlay_dimensions(state: &str) -> (f64, f64) {
-    if state == "streaming" {
+    if state == "pasting" || state == "delivery_ready" {
+        (380.0, OVERLAY_HEIGHT)
+    } else if state == "streaming" {
         (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
     } else {
         (OVERLAY_WIDTH, OVERLAY_HEIGHT)
@@ -884,4 +886,36 @@ mod tests {
         // Top offset rides the DPI scale alone, so the top edge doesn't move.
         assert_eq!(top_y, -195);
     }
+}
+
+/// Delivery is distinct from recognition; dismiss the ready hint without hiding newer work.
+pub fn show_delivery_overlay(app: &AppHandle, pasting: bool) {
+    if settings::get_settings(app).overlay_style == OverlayStyle::None {
+        return;
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if handle
+            .state::<std::sync::Arc<crate::managers::audio::AudioRecordingManager>>()
+            .is_recording()
+            || handle
+                .state::<crate::TranscriptionCoordinator>()
+                .has_pending()
+        {
+            return;
+        }
+        show_overlay_state_on_main(&handle, if pasting { "pasting" } else { "delivery_ready" });
+        if !pasting {
+            let generation = OVERLAY_SHOW_GENERATION.load(Ordering::SeqCst);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                let inner = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    if OVERLAY_SHOW_GENERATION.load(Ordering::SeqCst) == generation {
+                        hide_recording_overlay(&inner);
+                    }
+                });
+            });
+        }
+    });
 }

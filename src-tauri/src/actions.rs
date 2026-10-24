@@ -597,24 +597,9 @@ impl ShortcutAction for TranscribeAction {
                                 }
                             }
                             if !processed.final_text.is_empty() {
-                                // Wait for the paste so results cannot overtake each other.
-                                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                                let paste_app = ah.clone();
-                                if let Err(error) = ah.run_on_main_thread(move || {
-                                    if let Err(error) = utils::paste(processed.final_text, paste_app.clone()) {
-                                        error!("Failed to paste transcription: {error}");
-                                        let _ = paste_app.emit("paste-error", ());
-                                    }
-                                    let _ = done_tx.send(());
-                                }) {
-                                    error!("Failed to schedule paste: {error}");
+                                if let Err(error) = crate::delivery::enqueue(ah.clone(), benchmark_recording.clone(), processed.final_text) {
+                                    error!("Could not queue delivery; transcript remains in History: {error}");
                                     let _ = ah.emit("paste-error", ());
-                                } else {
-                                    let _ = done_rx.await;
-                                    if let Err(error) = crate::paste_tx::wait_for_completion() {
-                                        error!("{error}");
-                                        let _ = ah.emit("paste-error", ());
-                                    }
                                 }
                             }
                         }

@@ -10,6 +10,7 @@ mod chinese_script;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod delivery;
 mod helpers;
 mod input;
 mod live_capture;
@@ -707,6 +708,8 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_use_accessibility_context_setting,
             remote_stt::set_remote_stt,
             stt_benchmark::get_stt_benchmarks,
+            delivery::get_delivery_status,
+            delivery::resolve_delivery,
             shortcut::change_update_checks_setting,
             shortcut::change_show_whats_new_on_update_setting,
             shortcut::change_whats_new_last_seen_version_setting,
